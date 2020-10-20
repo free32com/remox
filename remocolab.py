@@ -24,7 +24,25 @@ def _download(url, path):
     print("Failed to download ", url)
     raise
 
-def _setupSSHDImpl(ngrok_token, ngrok_region, custom_ngrok_server):
+def _get_gpu_name():
+  r = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"], stdout = subprocess.PIPE, universal_newlines = True)
+  if r.returncode != 0:
+    return None
+  return r.stdout.strip()
+
+def _check_gpu_available():
+  gpu_name = _get_gpu_name()
+  if gpu_name == None:
+    print("This is not a runtime with GPU")
+  elif gpu_name == "Tesla K80":
+    print("Warning! GPU of your assigned virtual machine is Tesla K80.")
+    print("You might get better GPU by reseting the runtime.")
+  else:
+    return True
+
+  return IPython.utils.io.ask_yes_no("Do you want to continue? [y/n]")
+
+def _setupSSHDImpl(ngrok_token, ngrok_region):
   #apt-get update
   #apt-get upgrade
   cache = apt.Cache()
@@ -64,10 +82,12 @@ def _setupSSHDImpl(ngrok_token, ngrok_region, custom_ngrok_server):
   root_password = secrets.token_urlsafe()
   user_password = secrets.token_urlsafe()
   user_name = "colab"
-  print("✂️"*24)
+  print("_"*60)
+  print("‾"*60)
   print(f"root password: {root_password}")
   print(f"{user_name} password: {user_password}")
-  print("✂️"*24)
+  print("_"*90)
+  print("‾"*90)
   subprocess.run(["useradd", "-s", "/bin/bash", "-m", user_name])
   subprocess.run(["adduser", user_name, "sudo"], check = True)
   subprocess.run(["chpasswd"], input = f"root:{root_password}", universal_newlines = True)
@@ -77,17 +97,7 @@ def _setupSSHDImpl(ngrok_token, ngrok_region, custom_ngrok_server):
   if not pathlib.Path('/root/.ngrok2/ngrok.yml').exists():
     subprocess.run(["./ngrok", "authtoken", ngrok_token])
 
-  #https://github.com/inconshreveable/ngrok/blob/master/docs/SELFHOSTING.md#5-configure-the-client
-  if custom_ngrok_server != None:
-    with open('/root/.ngrok2/ngrok.yml', 'a') as f:
-      f.write(f"\n\nserver_addr: {custom_ngrok_server}\n")
-      f.write("trust_host_root_certs: true\n")
-
-  ngrok_args = ["./ngrok", "tcp"]
-  if ngrok_region != None:
-    ngrok_args += ["-region", ngrok_region]
-  ngrok_args.append("22")
-  ngrok_proc = subprocess.Popen(ngrok_args)
+  ngrok_proc = subprocess.Popen(["./ngrok", "tcp", "-region", ngrok_region, "22"])
   time.sleep(2)
   if ngrok_proc.poll() != None:
     raise RuntimeError("Failed to run ngrok. Return code:" + str(ngrok_proc.returncode) + "\nSee runtime log for more info.")
@@ -100,25 +110,28 @@ def _setupSSHDImpl(ngrok_token, ngrok_region, custom_ngrok_server):
   port = m.group(2)
 
   ssh_common_options =  "-o UserKnownHostsFile=/dev/null -o VisualHostKey=yes"
-  print("---")
   print("Command to connect to the ssh server:")
-  print("✂️"*24)
+  print("‾"*37)
   print(f"ssh {ssh_common_options} -p {port} {user_name}@{hostname}")
-  print("✂️"*24)
-  print("---")
+  print("_"*113)
+  print("‾"*113)
   print("If you use VNC:")
-  print("✂️"*24)
+  print("‾"*15)
   print(f"ssh {ssh_common_options} -L 5901:localhost:5901 -p {port} {user_name}@{hostname}")
-  print("✂️"*24)
+  print("_"*113)
+  print("‾"*113)
 
-def setupSSHD(ngrok_region = None, check_gpu_available = False, custom_ngrok_server = None):
+def setupSSHD(ngrok_region = None, check_gpu_available = False):
+  if check_gpu_available and not _check_gpu_available():
+    return False
+
   print("---")
   print("Copy&paste your tunnel authtoken from https://dashboard.ngrok.com/auth")
   print("(You need to sign up for ngrok and login,)")
   #Set your ngrok Authtoken.
   ngrok_token = getpass.getpass()
 
-  if not ngrok_region and custom_ngrok_server == None:
+  if not ngrok_region:
     print("Select your ngrok region:")
     print("us - United States (Ohio)")
     print("eu - Europe (Frankfurt)")
@@ -129,20 +142,81 @@ def setupSSHD(ngrok_region = None, check_gpu_available = False, custom_ngrok_ser
     print("in - India (Mumbai)")
     ngrok_region = region = input()
 
-  _setupSSHDImpl(ngrok_token, ngrok_region, custom_ngrok_server)
+  _setupSSHDImpl(ngrok_token, ngrok_region)
   return True
+
+def _setup_nvidia_gl():
+  # Install TESLA DRIVER FOR LINUX X64.
+  # Kernel module in this driver is already loaded and cannot be neither removed nor updated.
+  # (nvidia, nvidia_uvm, nvidia_drm. See dmesg)
+  # Version number of nvidia driver for Xorg must match version number of these kernel module.
+  # But existing nvidia driver for Xorg might not match.
+  # So overwrite them with the nvidia driver that is same version to loaded kernel module.
+  ret = subprocess.run(
+                  ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
+                  stdout = subprocess.PIPE,
+                  check = True,
+                  universal_newlines = True)
+  nvidia_version = ret.stdout.strip()
+  nvidia_url = "https://us.download.nvidia.com/tesla/{0}/NVIDIA-Linux-x86_64-{0}.run".format(nvidia_version)
+  _download(nvidia_url, "nvidia.run")
+  pathlib.Path("nvidia.run").chmod(stat.S_IXUSR)
+  subprocess.run(["./nvidia.run", "--no-kernel-module", "--ui=none"], input = "1\n", check = True, universal_newlines = True)
+
+  #https://virtualgl.org/Documentation/HeadlessNV
+  subprocess.run(["nvidia-xconfig",
+                  "-a",
+                  "--allow-empty-initial-configuration",
+                  "--virtual=1920x1200",
+                  "--busid", "PCI:0:4:0"],
+                 check = True
+                )
+
+  with open("/etc/X11/xorg.conf", "r") as f:
+    conf = f.read()
+    conf = re.sub('(Section "Device".*?)(EndSection)',
+                  '\\1    MatchSeat      "seat-1"\n\\2',
+                  conf,
+                  1,
+                  re.DOTALL)
+  #  conf = conf + """
+  #Section "Files"
+  #    ModulePath "/usr/lib/xorg/modules"
+  #    ModulePath "/usr/lib/x86_64-linux-gnu/nvidia-418/xorg/"
+  #EndSection
+  #"""
+
+  with open("/etc/X11/xorg.conf", "w") as f:
+    f.write(conf)
+
+  #!service lightdm stop
+  subprocess.run(["/opt/VirtualGL/bin/vglserver_config", "-config", "+s", "+f"], check = True)
+  #user_name = "colab"
+  #!usermod -a -G vglusers $user_name
+  #!service lightdm start
+
+  # Run Xorg server
+  # VirtualGL and OpenGL application require Xorg running with nvidia driver to get Hardware 3D Acceleration.
+  #
+  # Without "-seat seat-1" option, Xorg try to open /dev/tty0 but it doesn't exists.
+  # You can create /dev/tty0 with "mknod /dev/tty0 c 4 0" but you will get permision denied error.
+  subprocess.Popen(["Xorg", "-seat", "seat-1", "-allowMouseOpenFail", "-novtswitch", "-nolisten", "tcp"])
 
 def _setupVNC():
   libjpeg_ver = "2.0.3"
+  virtualGL_ver = "2.6.2"
   turboVNC_ver = "2.2.3"
 
-  libjpeg_url = "https://svwh.dl.sourceforge.net/project/libjpeg-turbo/{0}/libjpeg-turbo-official_{0}_amd64.deb".format(libjpeg_ver)
-  turboVNC_url = "https://svwh.dl.sourceforge.net/project/turbovnc/{0}/turbovnc_{0}_amd64.deb".format(turboVNC_ver)
+  libjpeg_url = "https://master.dl.sourceforge.net/project/libjpeg-turbo/{0}/libjpeg-turbo-official_{0}_amd64.deb".format(libjpeg_ver)
+  virtualGL_url = "https://master.dl.sourceforge.net/project/virtualgl/{0}/virtualgl_{0}_amd64.deb".format(virtualGL_ver)
+  turboVNC_url = "https://master.dl.sourceforge.net/project/turbovnc/{0}/turbovnc_{0}_amd64.deb".format(turboVNC_ver)
 
   _download(libjpeg_url, "libjpeg-turbo.deb")
+  _download(virtualGL_url, "virtualgl.deb")
   _download(turboVNC_url, "turbovnc.deb")
   cache = apt.Cache()
   apt.debfile.DebPackage("libjpeg-turbo.deb", cache).install()
+  apt.debfile.DebPackage("virtualgl.deb", cache).install()
   apt.debfile.DebPackage("turbovnc.deb", cache).install()
 
   _installPkgs(cache, "lxde", "firefox")
@@ -155,16 +229,35 @@ no-httpd
 no-x11-tcp-connections
 """)
 
+  gpu_name = _get_gpu_name()
+  if gpu_name != None:
+    _setup_nvidia_gl()
+
   vncrun_py = tempfile.gettempdir() / pathlib.Path("vncrun.py")
   vncrun_py.write_text("""\
 import subprocess, secrets, pathlib
 
 vnc_passwd = secrets.token_urlsafe()[:8]
 vnc_viewonly_passwd = secrets.token_urlsafe()[:8]
-print("✂️"*24)
+print("_"*33)
+print("‾"*33)
 print("VNC password: {}".format(vnc_passwd))
 print("VNC view only password: {}".format(vnc_viewonly_passwd))
-print("✂️"*24)
+print("_"*56)
+print("‾"*56)
+print("Script credits goes to: https://github.com/demotomohiro")
+print("")
+print("To get more tutorials like this,")
+print("subscribe to the YT channel: https://bit.ly/sudoken-youtube-channel")
+print("_"*67)
+print("‾"*67)
+print(" ███████  ██    ██  ██████    ██████   ██   ██  ███████  ███    ██ ")
+print(" ██       ██    ██  ██   ██  ██    ██  ██  ██   ██       ████   ██ ")
+print(" ███████  ██    ██  ██   ██  ██    ██  █████    █████    ██ ██  ██ ")
+print("      ██  ██    ██  ██   ██  ██    ██  ██  ██   ██       ██  ██ ██ ")
+print(" ███████   ██████   ██████    ██████   ██   ██  ███████  ██   ████ ")
+print("_"*67)
+print("‾"*67)
 vncpasswd_input = "{0}\\n{1}".format(vnc_passwd, vnc_viewonly_passwd)
 vnc_user_dir = pathlib.Path.home().joinpath(".vnc")
 vnc_user_dir.mkdir(exist_ok=True)
@@ -190,6 +283,6 @@ subprocess.run(
                     universal_newlines = True)
   print(r.stdout)
 
-def setupVNC(ngrok_region = None, custom_ngrok_server = None):
-  if setupSSHD(ngrok_region, True, custom_ngrok_server):
+def setupVNC(ngrok_region = None):
+  if setupSSHD(ngrok_region, True):
     _setupVNC()
