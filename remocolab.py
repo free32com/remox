@@ -42,7 +42,7 @@ def _check_gpu_available():
 
   return IPython.utils.io.ask_yes_no("Do you want to continue? [y/n]")
 
-def _setupSSHDImpl(ngrok_token, ngrok_region):
+def _setupSSHDImpl(ngrok_token, ngrok_region, custom_ngrok_server):
   #apt-get update
   #apt-get upgrade
   cache = apt.Cache()
@@ -95,7 +95,17 @@ def _setupSSHDImpl(ngrok_token, ngrok_region):
   if not pathlib.Path('/root/.ngrok2/ngrok.yml').exists():
     subprocess.run(["./ngrok", "authtoken", ngrok_token])
 
-  ngrok_proc = subprocess.Popen(["./ngrok", "tcp", "-region", ngrok_region, "22"])
+  #https://github.com/inconshreveable/ngrok/blob/master/docs/SELFHOSTING.md#5-configure-the-client
+  if custom_ngrok_server != None:
+    with open('/root/.ngrok2/ngrok.yml', 'a') as f:
+      f.write(f"\n\nserver_addr: {custom_ngrok_server}\n")
+      f.write("trust_host_root_certs: true\n")
+
+  ngrok_args = ["./ngrok", "tcp"]
+  if ngrok_region != None:
+    ngrok_args += ["-region", ngrok_region]
+  ngrok_args.append("22")
+  ngrok_proc = subprocess.Popen(ngrok_args)
   time.sleep(2)
   if ngrok_proc.poll() != None:
     raise RuntimeError("Failed to run ngrok. Return code:" + str(ngrok_proc.returncode) + "\nSee runtime log for more info.")
@@ -119,7 +129,7 @@ def _setupSSHDImpl(ngrok_token, ngrok_region):
   print(f"ssh {ssh_common_options} -L 5901:localhost:5901 -p {port} {user_name}@{hostname}")
   print("✂️"*24)
 
-def setupSSHD(ngrok_region = None, check_gpu_available = False):
+def setupSSHD(ngrok_region = None, check_gpu_available = False, custom_ngrok_server = None):
   if check_gpu_available and not _check_gpu_available():
     return False
 
@@ -129,7 +139,7 @@ def setupSSHD(ngrok_region = None, check_gpu_available = False):
   #Set your ngrok Authtoken.
   ngrok_token = getpass.getpass()
 
-  if not ngrok_region:
+  if not ngrok_region and custom_ngrok_server == None:
     print("Select your ngrok region:")
     print("us - United States (Ohio)")
     print("eu - Europe (Frankfurt)")
@@ -140,7 +150,7 @@ def setupSSHD(ngrok_region = None, check_gpu_available = False):
     print("in - India (Mumbai)")
     ngrok_region = region = input()
 
-  _setupSSHDImpl(ngrok_token, ngrok_region)
+  _setupSSHDImpl(ngrok_token, ngrok_region, custom_ngrok_server)
   return True
 
 def _setup_nvidia_gl():
@@ -266,6 +276,6 @@ subprocess.run(
                     universal_newlines = True)
   print(r.stdout)
 
-def setupVNC(ngrok_region = None):
-  if setupSSHD(ngrok_region, True):
+def setupVNC(ngrok_region = None, custom_ngrok_server = None):
+  if setupSSHD(ngrok_region, True, custom_ngrok_server):
     _setupVNC()
